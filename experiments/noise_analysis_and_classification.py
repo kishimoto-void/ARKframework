@@ -1,0 +1,1 @@
+The full content here, but since long, I need to read it from local file
