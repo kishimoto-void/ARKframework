@@ -1,23 +1,36 @@
 #!/usr/bin/env python3
 """
-ARK2 Free Energy Version (v2026-07-10 Improved)
+ARK2 Theoretical Refactor (v2026-07-10)
 
-MetaVoid + Emergence Engine を、熱力学 + 自由エネルギー最小化の框組みで統合した版。
-【改善点 (experiments/ からの知見を忠実に統合)】
-- AdvancedNoiseGenerator (White/Pink/Brown/STRUCTURED_RESIDUE/STRUCTURED_PHASE) を統合
-- NoiseAnalyzer による多軸ノイズ統計・residue相関解析を追加
-- デフォルト noise_type = STRUCTURED_RESIDUE （実験で res_nv_corr=0.41 と最高値、residueがノイズを积極的に「取り込み・代謝」する挙動を確認）
-- ノイズが residue/phase と結合し、velocity・I_target・residue更新に摄動を与える
-- 回復時に noise coupling が強い場合の efficiency ボーナスを追加（実験知見に基づく homeostasis 改善）
-- RecoveryEvent に chosen_action を追加し、printバグを修正
-- 動的ノイズ変調 + analyzer による phase/metrics 強化
-- 実験は sandbox で忠実に multi-seed 実行して検証済み
+【理論的再設計の指針（ユーザー提案を忠実に反映）】
+実験は理論を「検証」するものであり、理論を「決める」ものではない。
+長期的に発展しやすいよう、以下のように中心概念を整理：
 
-これにより ARK2 は「熱力学的に駆動される誤知・適応モデル」としてさらにロバストになり、
-residue を中心としたノイズ代謝ループが自然に機能する。
+Potential → Fluctuation（ゆらぎ） → Interaction → ResidualState → Free Energy → Recovery（自己組織化） → Emergence → Potential
+
+これにより「ノイズ」「残溜」「構造」「創発」が一つの循環として統一的に表現できる。
+「ノイズと残溜は観測階段によるラベルの違いではないか」という発想を採用し、
+Fluctuation を基本概念に揚える。
+
+具体的な改善（①～⑦）:
+① FluctuationType を White/Pink/Brown/ResidueCoupled/PhaseCoupled として定義。
+   デフォルトは固定せず、状態に応じて切り替わる設計（環境適応型）。
+② Noise / Residue を Fluctuation → Interaction → ResidualState に統一。
+   「ノイズ」は観測者ラベル → Fluctuation（ゆらぎ）がARKの基本。
+③ NoiseAnalyzer → FieldAnalyzer に拡張（Potential / Fluctuation / ResidualState / Entropy / Phase を一括解析可能に）。
+④ Free Energy を F = Potential + ResidualState - T×Entropy に拡張。
+   Potential により「まだ実現していない可能性」をエネルギーとして扱える。
+⑤ Recovery を「best_score による最適候補選択」から「複数候補の混合による自己組織化」に変更。
+   少しずつ良い方向が残る創発的な回復へ。
+⑥ Phase を内部で連続量 (0.0～1.0) として保持。表示ラベルはマッピングのみ。
+⑦ ResidualState を thermal / informational / structural / temporal の複数種類に一般化。
+   将来的な拡張性を確保（現在は thermal を主軸に）。
+
+実験（sandbox multi-seed 忠実実行）で動作検証済み。
+理論が先にあり、実験がそれを裏付ける形を目指す。
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections import deque
 import random
 import math
@@ -28,95 +41,112 @@ from scipy import stats as scipy_stats
 
 
 # ============================================================
-# experiments/noise_analysis_and_classification.py から統合・適応したノイズ機構
-# ARK2 の residue 中心ダイナミクスと親和性の高い STRUCTURED_RESIDUE を活用
+# ① FluctuationModel（環境・状態に応じて切り替わる）
+#    実験結果に引っ掛られ過ぎない理論的中立名前
 # ============================================================
-class NoiseType(Enum):
-    WHITE_UNIFORM = auto()
-    WHITE_GAUSSIAN = auto()
-    PINK = auto()          # 1/f-like
-    BROWN = auto()         # random-walk like
-    STRUCTURED_RESIDUE = auto()  # residue相関型（実験で res_nv_corr 最高・代謝に最適）
-    STRUCTURED_PHASE = auto()    # phase変調型
+class FluctuationType(Enum):
+    WHITE = auto()
+    PINK = auto()
+    BROWN = auto()
+    RESIDUE_COUPLED = auto()   # 旧 STRUCTURED_RESIDUE（residue と結合しやすい）
+    PHASE_COUPLED = auto()
 
 
-class AdvancedNoiseGenerator:
-    """既存の NoiseGenerator を拡張した多タイプ対応版（experiments/ 忠実移植）"""
+class FluctuationGenerator:
+    """
+    Fluctuation（ゆらぎ）生成器。
+    旧 AdvancedNoiseGenerator を理論名に改名。
+    各タイプは「観測ラベル」ではなく、系の相互作用様式として位置付ける。
+    """
     def __init__(self, seed: Optional[int] = None):
         self.rng = random.Random(seed if seed is not None else random.randint(0, 2**32-1))
         self.pink_state = 0.0
         self.brown_v = 0.0
 
-    def generate(self, noise_mod: float = 1.0,
-                 noise_type: NoiseType = NoiseType.WHITE_GAUSSIAN,
-                 residue: float = 0.0, phase: float = 0.0) -> Tuple[float, float]:
-        """nv: velocity noise, na: acceleration noise を返す。residue/phase と結合可能"""
-        if noise_type == NoiseType.WHITE_GAUSSIAN:
-            nv = self.rng.gauss(0.0, 0.20) * noise_mod
-            na = self.rng.gauss(0.0, 0.10) * noise_mod
-        elif noise_type == NoiseType.WHITE_UNIFORM:
-            nv = self.rng.uniform(-0.20, 0.20) * noise_mod
-            na = self.rng.uniform(-0.10, 0.10) * noise_mod
-        elif noise_type == NoiseType.PINK:
+    def generate(self, mod: float = 1.0,
+                 ftype: FluctuationType = FluctuationType.WHITE,
+                 residual: float = 0.0, phase: float = 0.5) -> Tuple[float, float]:
+        """fv: fluctuation velocity, fa: fluctuation acceleration"""
+        if ftype == FluctuationType.WHITE:
+            fv = self.rng.gauss(0.0, 0.20) * mod
+            fa = self.rng.gauss(0.0, 0.10) * mod
+        elif ftype == FluctuationType.PINK:
             white = self.rng.gauss(0.0, 0.20)
             self.pink_state = 0.85 * self.pink_state + white * 0.15
-            nv = self.pink_state * noise_mod * 0.6
-            na = self.rng.gauss(0.0, 0.06) * noise_mod
-        elif noise_type == NoiseType.BROWN:
+            fv = self.pink_state * mod * 0.6
+            fa = self.rng.gauss(0.0, 0.06) * mod
+        elif ftype == FluctuationType.BROWN:
             dv = self.rng.gauss(0.0, 0.04)
             self.brown_v = self.brown_v * 0.92 + dv
-            nv = self.brown_v * noise_mod * 1.2
-            na = self.rng.gauss(0.0, 0.03) * noise_mod
-        elif noise_type == NoiseType.STRUCTURED_RESIDUE:
+            fv = self.brown_v * mod * 1.2
+            fa = self.rng.gauss(0.0, 0.03) * mod
+        elif ftype == FluctuationType.RESIDUE_COUPLED:
             base = self.rng.gauss(0.0, 0.15)
-            nv = (base + 0.08 * math.tanh(residue * 0.8)) * noise_mod
-            na = (self.rng.gauss(0.0, 0.07) + 0.04 * residue) * noise_mod
-        else:  # STRUCTURED_PHASE
-            mod = 1.0 + 0.4 * math.sin(phase * 1.3)
-            nv = self.rng.gauss(0.0, 0.18) * noise_mod * mod
-            na = self.rng.gauss(0.0, 0.09) * noise_mod * (1.0 + 0.2 * math.cos(phase))
-        return nv, na
+            fv = (base + 0.08 * math.tanh(residual * 0.8)) * mod
+            fa = (self.rng.gauss(0.0, 0.07) + 0.04 * residual) * mod
+        else:  # PHASE_COUPLED
+            mod2 = 1.0 + 0.4 * math.sin(phase * 1.3 * 2 * math.pi)
+            fv = self.rng.gauss(0.0, 0.18) * mod * mod2
+            fa = self.rng.gauss(0.0, 0.09) * mod * (1.0 + 0.2 * math.cos(phase * 2 * math.pi))
+        return fv, fa
 
 
-class NoiseAnalyzer:
-    """ノイズ時系列の統計的特徴量抽出と residue 結合解析（experiments/ 忠実移植）"""
+# ============================================================
+# ③ FieldAnalyzer（Field 全体を解析）
+#    Potential / Fluctuation / ResidualState / Entropy / Phase を統合
+# ============================================================
+class FieldAnalyzer:
+    """
+    Field 全体の状態を解析するアナライザ。
+    将来的に Potential や Entropy の時系列も扱えるよう拡張余地を残す。
+    """
     def __init__(self):
-        self.samples_v: List[float] = []
-        self.samples_a: List[float] = []
-        self.residues: List[float] = []
-        self.phases: List[float] = []
+        self.fluct_v: List[float] = []
+        self.fluct_a: List[float] = []
+        self.residuals: List[float] = []      # thermal proxy
+        self.potentials: List[float] = []
+        self.entropies: List[float] = []
+        self.phases: List[float] = []         # 連続 0-1
         self.steps: List[int] = []
 
-    def collect(self, nv: float, na: float, residue: float = 0.0, phase: float = 0.0, step: int = 0):
-        self.samples_v.append(float(nv))
-        self.samples_a.append(float(na))
-        self.residues.append(float(residue))
+    def collect(self, fv: float, fa: float,
+                residual: float = 0.0,
+                potential: float = 0.0,
+                entropy: float = 0.0,
+                phase: float = 0.5,
+                step: int = 0):
+        self.fluct_v.append(float(fv))
+        self.fluct_a.append(float(fa))
+        self.residuals.append(float(residual))
+        self.potentials.append(float(potential))
+        self.entropies.append(float(entropy))
         self.phases.append(float(phase))
         self.steps.append(step)
 
     def analyze(self) -> Dict[str, float]:
-        if len(self.samples_v) < 8:
-            return {"status": "insufficient_data", "count": len(self.samples_v)}
-        v = np.asarray(self.samples_v, dtype=float)
-        a = np.asarray(self.samples_a, dtype=float)
-        res = np.asarray(self.residues, dtype=float)
+        if len(self.fluct_v) < 8:
+            return {"status": "insufficient_data", "count": len(self.fluct_v)}
+
+        v = np.asarray(self.fluct_v, dtype=float)
+        res = np.asarray(self.residuals, dtype=float)
+        pot = np.asarray(self.potentials, dtype=float)
+        ent = np.asarray(self.entropies, dtype=float)
         ph = np.asarray(self.phases, dtype=float)
 
-        metrics: Dict[str, float] = {
+        m: Dict[str, float] = {
             "count": len(v),
-            "mean_v": float(np.mean(v)),
-            "std_v": float(np.std(v)),
-            "var_v": float(np.var(v)),
-            "skew_v": float(scipy_stats.skew(v, bias=False)),
-            "kurt_v": float(scipy_stats.kurtosis(v, bias=False)),
-            "mean_a": float(np.mean(a)),
-            "std_a": float(np.std(a)),
-            "acf_lag1_v": self._safe_autocorr(v, 1),
-            "acf_lag2_v": self._safe_autocorr(v, 2),
-            "residue_corr_v": self._safe_corr(v, res),
-            "phase_corr_v": self._safe_corr(v, ph),
+            "mean_fluct_v": float(np.mean(v)),
+            "std_fluct_v": float(np.std(v)),
+            "var_fluct_v": float(np.var(v)),
+            "residue_corr": self._safe_corr(v, res),
+            "potential_corr": self._safe_corr(v, pot),
+            "entropy_corr": self._safe_corr(v, ent),
+            "phase_corr": self._safe_corr(v, ph),
+            "mean_residual": float(np.mean(res)),
+            "mean_potential": float(np.mean(pot)),
+            "mean_entropy": float(np.mean(ent)),
+            "mean_phase": float(np.mean(ph)),
         }
-
         try:
             f, Pxx = scipy_stats.periodogram(v, fs=1.0, scaling='spectrum')
             if len(f) > 12:
@@ -124,22 +154,14 @@ class NoiseAnalyzer:
                 logf = np.log(f[idx] + 1e-12)
                 logP = np.log(Pxx[idx] + 1e-12)
                 slope, _ = np.polyfit(logf, logP, 1)
-                metrics["spectral_slope"] = float(slope)
+                m["spectral_slope"] = float(slope)
             else:
-                metrics["spectral_slope"] = 0.0
+                m["spectral_slope"] = 0.0
         except Exception:
-            metrics["spectral_slope"] = 0.0
+            m["spectral_slope"] = 0.0
 
-        metrics["noise_energy"] = float(np.sum(v**2) / len(v))
-        return metrics
-
-    def _safe_autocorr(self, x: np.ndarray, lag: int) -> float:
-        if len(x) <= lag + 2:
-            return 0.0
-        try:
-            return float(np.corrcoef(x[:-lag], x[lag:])[0, 1])
-        except Exception:
-            return 0.0
+        m["fluct_energy"] = float(np.sum(v**2) / len(v))
+        return m
 
     def _safe_corr(self, x: np.ndarray, y: np.ndarray) -> float:
         if len(x) < 4 or np.std(y) < 1e-8 or np.std(x) < 1e-8:
@@ -149,63 +171,43 @@ class NoiseAnalyzer:
         except Exception:
             return 0.0
 
-    def classify(self) -> str:
-        """ 多軸ルールベース分類（amplitude × temporal × coupling）"""
-        m = self.analyze()
-        if m.get("status") == "insufficient_data":
-            return "unknown_insufficient_data"
-
-        var = m["var_v"]
-        acf1 = m["acf_lag1_v"]
-        res_corr = abs(m.get("residue_corr_v", 0.0))
-        spec_slope = m.get("spectral_slope", 0.0)
-        kurt = m["kurt_v"]
-        energy = m["noise_energy"]
-
-        if var < 0.025:
-            amp = "benign_low_amp"
-        elif var > 0.65:
-            amp = "disruptive_high_amp"
-        elif var > 0.28:
-            amp = "moderate_high_var"
+    def get_phase_label(self, phase: float) -> str:
+        """連続 phase (0.0～1.0) をラベルにマッピング（表示用）"""
+        if phase < 0.2:
+            return "Trapped"
+        elif phase < 0.5:
+            return "Prepared"
+        elif phase < 0.8:
+            return "Emergence"
         else:
-            amp = "moderate"
-
-        if acf1 > 0.45:
-            temp = "_persistent_long_memory"
-        elif acf1 > 0.20:
-            temp = "_mildly_persistent"
-        elif acf1 < -0.25:
-            temp = "_anti_correlated_oscillatory"
-        else:
-            temp = "_uncorrelated_white_like"
-
-        if res_corr > 0.35:
-            coup = "_residue_coupled"
-        elif spec_slope < -0.95:
-            coup = "_pink_colored"
-        elif spec_slope > 0.15:
-            coup = "_brown_wandering"
-        elif -0.6 < spec_slope < -0.15:
-            coup = "_pinkish"
-        else:
-            coup = "_white_spectral"
-
-        if kurt > 3.5:
-            tail = "_heavy_tailed_outliers"
-        elif kurt < -0.8:
-            tail = "_platykurtic"
-        else:
-            tail = ""
-
-        if energy > 0.12:
-            energy_tag = "_high_energy"
-        else:
-            energy_tag = ""
-
-        return f"{amp}{temp}{coup}{tail}{energy_tag}"
+            return "Dissipative"
 
 
+# ============================================================
+# ⑦ ResidualState（複数種類の残溜を一般化）
+# ============================================================
+@dataclass
+class ResidualState:
+    thermal: float = 0.0          # 旧 residue（摩擦熱）
+    informational: float = 0.0    # 将来拡張用
+    structural: float = 0.0
+    temporal: float = 0.0
+
+    def effective(self) -> float:
+        """ 有効残溜量（重み付け和）。現在は thermal を主に使用 """
+        return (self.thermal +
+                0.25 * self.informational +
+                0.15 * self.structural +
+                0.10 * self.temporal)
+
+    def metabolize(self, amount: float, efficiency: float = 0.018):
+        """ 代謝（ゆらぎとの相互作用で残溜を処理） """
+        self.thermal = max(0.0, self.thermal * (1.0 - 0.018) + amount * efficiency)
+
+
+# ============================================================
+# Adaptation / Recovery のデータ構造（phase を連続量対応に）
+# ============================================================
 @dataclass(frozen=True)
 class AdaptationState:
     gamma: float
@@ -213,14 +215,15 @@ class AdaptationState:
     I_target: float
     diversity: float
     entropy: float
-    phase: str
+    phase_cont: float          # 連続 0.0～1.0
+    phase_label: str
 
 
 @dataclass
 class RecoveryEvent:
     event_id: str
     step: int
-    residue_before: float
+    residual_before: float
     entropy_before: float
     released_work: float
     entropy_increase: float
@@ -228,32 +231,35 @@ class RecoveryEvent:
     free_energy_before: float
     score: float
     reason: str
-    chosen_action: str   # 改善: best_action を記録（printバグ修正）
+    chosen_action: str
+    mix_ratio: float = 0.0     # 自己組織化混合の度合い
 
 
+# ============================================================
+# ARK2 本体（理論循環 Potential → Fluctuation → ... → Emergence を体現）
+# ============================================================
 class ARK2FreeEnergy:
     """
-    ARK2 - Free Energy + Thermodynamic Cycle (Improved v2026-07-10)
+    ARK2 - Free Energy + Thermodynamic + Self-Organizing Emergence
 
-    - residue を摩擦熱（U）として扱う
-    - entropy を独立変数として導入（探索・不確実性）
-    - Recovery 時に熱を Work と Entropy に正しく分割（熱力学第2法則準拠）
-    - Free Energy F = residue - T*entropy の最小化趨勢
-    - 【新】AdvancedNoiseGenerator + NoiseAnalyzer 統合（experiments/ 知見）
-    - 【新】STRUCTURED_RESIDUE デフォルトで residue-noise 代謝ループを活性化
-    - 【新】ノイズが residue/phase と動的に結合し、回復効率に coupling ボーナス
+    中心循環:
+    Potential → Fluctuation → Interaction → ResidualState
+             → Free Energy (Potential + Residual - T*Entropy)
+             → Recovery (自己組織化混合) → Emergence → Potential
+
+    実験結果に縛られず、理論的一貫性を優先した設計。
     """
 
     def __init__(
         self,
-        steps: int = 200,
+        steps: int = 220,
         initial_gamma: float = 0.10,
         momentum_beta: float = 0.78,
-        residue_threshold: float = 18.5,  # 代謝効果を考慮してやや低めに（実験知見に基づくバランス）
+        residual_threshold: float = 17.5,
         friction_coefficient: float = 0.023,
         energy_conversion_efficiency: float = 0.42,
         exploration_temperature: float = 1.8,
-        noise_type: NoiseType = NoiseType.STRUCTURED_RESIDUE,  # 実験推奨デフォルト
+        fluctuation_type: FluctuationType = FluctuationType.RESIDUE_COUPLED,  # 中立デフォルト
         seed: Optional[int] = None
     ):
         if seed is not None:
@@ -264,18 +270,19 @@ class ARK2FreeEnergy:
         self.gamma = initial_gamma
         self.momentum_beta = momentum_beta
         self.velocity = 0.0
-        self.residue = 0.0
+        self.residual = ResidualState(thermal=0.0)   # ⑦ 一般化
         self.entropy = 0.0
-        self.residue_threshold = residue_threshold  # 18前後で回復が適度に発動するよう調整（代謝効果とのバランス）
+        self.potential = 0.3                         # ④ 初期 Potential（未実現可能性の代理）
+        self.residual_threshold = residual_threshold
         self.friction_coefficient = friction_coefficient
         self.energy_conversion_efficiency = energy_conversion_efficiency
         self.exploration_temperature = exploration_temperature
-        self.noise_type = noise_type
+        self.fluctuation_type = fluctuation_type     # ① 状態に応じて切り替わる
         self.epsilon = 1e-8
 
-        self.noise_gen = AdvancedNoiseGenerator(seed)
-        self.noise_analyzer = NoiseAnalyzer()
-        self.phase = random.uniform(0, 2 * math.pi)
+        self.fluct_gen = FluctuationGenerator(seed)
+        self.field_analyzer = FieldAnalyzer()        # ③
+        self.phase_cont = 0.45                       # ⑥ 連続 phase (0.0～1.0)
 
         self.checkpoints: List[AdaptationState] = []
         self.structural_reserve: deque[AdaptationState] = deque(maxlen=16)
@@ -287,36 +294,52 @@ class ARK2FreeEnergy:
         self._stuck_counter = 0
         self.recovery_count = 0
 
+    # 動的 FluctuationType 切り替え（環境適応の簡易版）
+    def _adapt_fluctuation_type(self):
+        eff = self.residual.effective()
+        if eff > 12.0:
+            self.fluctuation_type = FluctuationType.RESIDUE_COUPLED
+        elif self.phase_cont < 0.25:
+            self.fluctuation_type = FluctuationType.BROWN
+        elif self.phase_cont > 0.75:
+            self.fluctuation_type = FluctuationType.PHASE_COUPLED
+        else:
+            self.fluctuation_type = FluctuationType.WHITE
+
     def step(self) -> Dict[str, Any]:
         prev_gamma = self.gamma
         prev_velocity = self.velocity
 
-        # --- Phase update & Advanced Structured Noise (experiments 統合) ---
-        self.phase += 0.11 + 0.02 * np.sin(self.phase)
-        nv, na = self.noise_gen.generate(
-            noise_mod=max(0.55, 1.15 - self.residue * 0.012),
-            noise_type=self.noise_type,
-            residue=self.residue,
-            phase=self.phase
+        # ① 状態に応じた FluctuationType 適応
+        self._adapt_fluctuation_type()
+
+        # Phase を少し進める（連続）
+        self.phase_cont = float(np.clip(self.phase_cont + 0.008 + 0.003 * np.sin(self.phase_cont * 6.28), 0.0, 1.0))
+
+        # Fluctuation 生成（residue/phase と結合）
+        fv, fa = self.fluct_gen.generate(
+            mod=max(0.55, 1.12 - self.residual.effective() * 0.01),
+            ftype=self.fluctuation_type,
+            residual=self.residual.effective(),
+            phase=self.phase_cont
         )
 
-        # ノイズを ARK2 ダイナミクスに結合（velocity 摄動 + I_target 誤差 + residue 代謝効果）
-        noise_influence = 0.085 if self.noise_type == NoiseType.STRUCTURED_RESIDUE else 0.055
-        self.velocity += nv * noise_influence
-        # na を I_target 誤差に反映（ノイズが目標到達難易度を動的に変える）
-        R = self._calculate_resonance_proxy()
-        I_target = self._calculate_dynamic_I_target(R)
+        # Fluctuation を dynamics に反映（Interaction）
+        influence = 0.08 if self.fluctuation_type == FluctuationType.RESIDUE_COUPLED else 0.055
+        self.velocity += fv * influence
 
+        # I_target / critical / variance 計算（内部ゆらぎ + 外部 Fluctuation）
+        R = max(0.12, 0.66 - abs(self.gamma - 0.16) * 1.85)
+        I_target = 0.87 + 0.33 * R
         current_step = len(self.history_metrics)
         modulation = 0.16 * np.sin(2 * np.pi * current_step / 118)
         I_target = max(0.13, I_target + modulation)
 
-        # 内部 critical_noise / variance にノイズ効果をブレンド
-        critical_noise_ratio = max(0.0005, 0.72 * np.exp(-abs(self.gamma - 0.13) * 2.1) + abs(na) * 0.08)
-        variance = max(0.0012, 0.72 * (0.125 - abs(self.gamma - 0.125)) + abs(nv) * 0.03)
+        critical = max(0.0005, 0.72 * np.exp(-abs(self.gamma - 0.13) * 2.1) + abs(fa) * 0.07)
+        variance = max(0.0012, 0.72 * (0.125 - abs(self.gamma - 0.125)) + abs(fv) * 0.025)
 
         tol_I = 0.05 * I_target
-        e_I = critical_noise_ratio - I_target + na * 0.45   # na による追加バイアス
+        e_I = critical - I_target + fa * 0.4
         near_target = abs(e_I) < tol_I
 
         if near_target:
@@ -326,7 +349,7 @@ class ARK2FreeEnergy:
             contrib_I = e_I / (I_target + self.epsilon)
             self._stuck_counter += 1
 
-        dynamic_beta = self.momentum_beta * np.exp(-self.residue * self.friction_coefficient)
+        dynamic_beta = self.momentum_beta * np.exp(-self.residual.effective() * self.friction_coefficient)
         d_gamma = 0.0046 * (contrib_I + 0.52 * (variance - 0.05))
 
         self.velocity = dynamic_beta * self.velocity + (1.0 - dynamic_beta) * d_gamma
@@ -342,29 +365,37 @@ class ARK2FreeEnergy:
         if len(self.approach_buffer) >= 10:
             approach_diversity = float(np.std(self.approach_buffer))
 
+        # ResidualState 更新（thermal を主に）
         if near_target and approach_diversity < 0.0018:
-            self.residue += 1.55 + (self._stuck_counter * 0.07)
+            self.residual.thermal += 1.55 + (self._stuck_counter * 0.07)
         else:
-            self.residue = max(0.0, self.residue * 0.96)
+            self.residual.thermal = max(0.0, self.residual.thermal * 0.96)
 
-        # STRUCTURED_RESIDUE 特有の代謝効果（experiments で確認された res_nv_corr 高値を利用）
-        if self.noise_type == NoiseType.STRUCTURED_RESIDUE:
-            self.residue = max(0.0, self.residue * 0.982 + abs(na) * 0.018)
+        # ⑦ ResidualState の代謝（Fluctuation との Interaction）
+        if self.fluctuation_type == FluctuationType.RESIDUE_COUPLED:
+            self.residual.metabolize(abs(fa), efficiency=0.022)
 
-        free_energy = self.residue - self.exploration_temperature * self.entropy
+        # ④ Free Energy 拡張（Potential + Residual - T*Entropy）
+        free_energy = (self.potential +
+                       self.residual.effective() -
+                       self.exploration_temperature * self.entropy)
+
+        # Potential の微小ダイナミクス（未実現可能性のゆらぎ）
+        self.potential = max(0.05, self.potential * 0.995 + 0.01 * (0.5 - abs(self.gamma - 0.25)))
 
         triggered_recovery = False
         released_work = 0.0
         entropy_increase = 0.0
+        mix_ratio = 0.0
 
-        if self.residue >= self.residue_threshold:
-            triggered_recovery, released_work, entropy_increase = self._free_energy_recovery(
+        if self.residual.effective() >= self.residual_threshold:
+            triggered_recovery, released_work, entropy_increase, mix_ratio = self._self_organizing_recovery(
                 I_target, approach_diversity, free_energy
             )
             if triggered_recovery:
                 self.recovery_count += 1
 
-        phase = self._classify_phase(critical_noise_ratio, variance)
+        phase_label = self.field_analyzer.get_phase_label(self.phase_cont)
 
         current_state = AdaptationState(
             gamma=self.gamma,
@@ -372,7 +403,8 @@ class ARK2FreeEnergy:
             I_target=I_target,
             diversity=approach_diversity,
             entropy=self.entropy,
-            phase=phase
+            phase_cont=self.phase_cont,
+            phase_label=phase_label
         )
 
         if approach_diversity > 0.0055 and len(self.checkpoints) < 6:
@@ -382,113 +414,112 @@ class ARK2FreeEnergy:
 
         self.structural_reserve.append(current_state)
 
-        # NoiseAnalyzer に収集（動的解析・分類のため）
-        self.noise_analyzer.collect(nv, na, self.residue, self.phase, current_step)
+        # ③ FieldAnalyzer に収集
+        self.field_analyzer.collect(
+            fv, fa,
+            residual=self.residual.effective(),
+            potential=self.potential,
+            entropy=self.entropy,
+            phase=self.phase_cont,
+            step=current_step
+        )
 
-        # 最新の noise 分類・相関を metrics に（insufficient 時はスキップ）
-        noise_metrics = self.noise_analyzer.analyze()
-        noise_class = self.noise_analyzer.classify() if noise_metrics.get("status") != "insufficient_data" else "initializing"
-        res_corr = round(noise_metrics.get("residue_corr_v", 0.0), 3) if noise_metrics.get("status") != "insufficient_data" else 0.0
+        field_m = self.field_analyzer.analyze()
+        fluct_class = "residue_coupled" if self.fluctuation_type == FluctuationType.RESIDUE_COUPLED else field_m.get("status", "active")
 
         metrics = {
             "step": current_step,
             "gamma": round(self.gamma, 4),
             "velocity": round(self.velocity, 5),
             "I_target": round(I_target, 4),
-            "residue": round(self.residue, 2),
+            "residual_thermal": round(self.residual.thermal, 2),
+            "residual_effective": round(self.residual.effective(), 2),
+            "potential": round(self.potential, 3),
             "entropy": round(self.entropy, 3),
             "free_energy": round(free_energy, 3),
             "approach_diversity": round(approach_diversity, 5),
             "near_target": near_target,
             "triggered_recovery": triggered_recovery,
             "released_work": round(released_work, 4),
-            "phase": phase,
+            "phase_cont": round(self.phase_cont, 3),
+            "phase_label": phase_label,
             "recovery_count": self.recovery_count,
-            "noise_type": self.noise_type.name,
-            "noise_class": noise_class,
-            "residue_noise_corr": res_corr,
-            "nv": round(nv, 4),
-            "na": round(na, 4)
+            "fluctuation_type": self.fluctuation_type.name,
+            "fluct_class": fluct_class,
+            "fluct_res_corr": round(field_m.get("residue_corr", 0.0), 3),
+            "fv": round(fv, 4),
+            "fa": round(fa, 4)
         }
         self.history_metrics.append(metrics)
-
         return metrics
 
-    def _free_energy_recovery(self, current_I_target: float, current_diversity: float, current_free_energy: float) -> Tuple[bool, float, float]:
+    # ⑤ Recovery を「自己組織化混合」へ変更
+    def _self_organizing_recovery(self, current_I_target: float, current_diversity: float,
+                                   current_free_energy: float) -> Tuple[bool, float, float, float]:
         candidates = list(self.checkpoints) + list(self.structural_reserve)[-6:]
         if not candidates:
-            return False, 0.0, 0.0
+            return False, 0.0, 0.0, 0.0
 
-        best_score = -999.0
-        best_cand = None
-        best_action = "none"
-
+        # スコア計算（旧 best_score ロジックを残しつつ）
+        scored = []
         for cand in candidates:
             locality = 1.0 / (1.0 + abs(cand.gamma - self.gamma) * 11)
             diversity_gain = max(0.0, cand.diversity - current_diversity) * 3.0
             reach_gain = max(0.0, (cand.I_target - current_I_target) * 0.85)
-            redundancy = min(1.6, len([c for c in candidates if abs(c.gamma - cand.gamma) < 0.028]))
             fe_bonus = max(0.0, (current_free_energy - (cand.gamma * 0.3)) * 0.4)
+            score = locality + diversity_gain + reach_gain + fe_bonus
+            scored.append((score, cand))
 
-            score = (locality * 1.0 + diversity_gain * 1.25 + reach_gain * 1.0 + redundancy * 0.6 + fe_bonus * 0.9)
+        if not scored:
+            return False, 0.0, 0.0, 0.0
 
-            if score > best_score:
-                best_score = score
-                best_cand = cand
-                best_action = "boost_positive" if cand.gamma > self.gamma else "boost_negative"
+        # 自己組織化: 上位数個を重み付け混合（少しずつ良い方向が残る）
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top_k = min(3, len(scored))
+        total_score = sum(s for s, _ in scored[:top_k]) + 1e-8
+        weights = [s / total_score for s, _ in scored[:top_k]]
+        mix_cands = [c for _, c in scored[:top_k]]
 
-        if best_cand:
-            # 改善: noise coupling が強い（residue_coupled）場合に回復効率を向上（experiments 知見）
-            noise_bonus = 1.0
-            if len(self.noise_analyzer.samples_v) > 8:
-                m = self.noise_analyzer.analyze()
-                if abs(m.get("residue_corr_v", 0.0)) > 0.28:
-                    noise_bonus = 1.18  # residue-noise 代謝が活発な時に Work 変換効率アップ
+        # 重み付き平均で新しい状態を生成（創発的な混合）
+        new_gamma = sum(w * c.gamma for w, c in zip(weights, mix_cands))
+        new_velocity = sum(w * c.velocity for w, c in zip(weights, mix_cands)) * 0.6
+        mix_ratio = 0.6 + 0.3 * (top_k / 3.0)   # 混合の強さ指標
 
-            released_work = self.residue * self.energy_conversion_efficiency * noise_bonus
-            entropy_increase = self.residue * (1.0 - self.energy_conversion_efficiency)
+        # 現在の状態と少しブレンド（急激な変化を避ける自己組織化）
+        blend = 0.65
+        self.gamma = float(np.clip(blend * self.gamma + (1 - blend) * new_gamma, 0.02, 0.46))
+        self.velocity = new_velocity + (1 - blend) * self.velocity * 0.4
 
-            direction = 1.0 if best_action == "boost_positive" else -1.0
-            boost = direction * (0.017 + released_work * 0.0045)
+        # 熱 → Work + Entropy（bonus は coupling 強度で）
+        noise_bonus = 1.0
+        field_m = self.field_analyzer.analyze()
+        if field_m.get("residue_corr", 0.0) > 0.25:
+            noise_bonus = 1.15
 
-            self.velocity = boost
-            self.entropy += entropy_increase
-            self.residue = max(0.0, self.residue * 0.32)
+        released_work = self.residual.effective() * self.energy_conversion_efficiency * noise_bonus
+        entropy_increase = self.residual.effective() * (1.0 - self.energy_conversion_efficiency)
 
-            self.event_counter += 1
-            event = RecoveryEvent(
-                event_id=f"recov_{self.event_counter}",
-                step=len(self.history_metrics),
-                residue_before=round(self.residue + (self.residue * 0.68), 2),
-                entropy_before=round(self.entropy - entropy_increase, 3),
-                released_work=round(released_work, 4),
-                entropy_increase=round(entropy_increase, 4),
-                velocity_after=round(self.velocity, 5),
-                free_energy_before=round(current_free_energy, 3),
-                score=round(best_score, 3),
-                reason=f"stuck_{self._stuck_counter}_steps_FE={current_free_energy:.2f}",
-                chosen_action=best_action
-            )
-            self.recovery_events.append(event)
-            return True, released_work, entropy_increase
+        self.velocity += 0.017 * (1 if new_gamma > self.gamma else -1)
+        self.entropy += entropy_increase
+        self.residual.thermal = max(0.0, self.residual.thermal * 0.32)
 
-        return False, 0.0, 0.0
-
-    def _calculate_resonance_proxy(self) -> float:
-        return max(0.12, 0.66 - abs(self.gamma - 0.16) * 1.85)
-
-    def _calculate_dynamic_I_target(self, R: float) -> float:
-        return 0.87 + 0.33 * R
-
-    def _classify_phase(self, critical_noise_ratio: float, variance: float) -> str:
-        if critical_noise_ratio > 1.08:
-            return "Emergence"
-        elif variance < 0.011:
-            return "Trapped"
-        elif 0.70 <= critical_noise_ratio <= 1.08:
-            return "Prepared"
-        else:
-            return "Dissipative"
+        self.event_counter += 1
+        event = RecoveryEvent(
+            event_id=f"recov_{self.event_counter}",
+            step=len(self.history_metrics),
+            residual_before=round(self.residual.effective() + self.residual.effective() * 0.68, 2),
+            entropy_before=round(self.entropy - entropy_increase, 3),
+            released_work=round(released_work, 4),
+            entropy_increase=round(entropy_increase, 4),
+            velocity_after=round(self.velocity, 5),
+            free_energy_before=round(current_free_energy, 3),
+            score=round(scored[0][0], 3),
+            reason=f"self_org_mix_{top_k}_candidates",
+            chosen_action="mixed_self_organizing",
+            mix_ratio=round(mix_ratio, 3)
+        )
+        self.recovery_events.append(event)
+        return True, released_work, entropy_increase, mix_ratio
 
     def run(self, steps: Optional[int] = None) -> List[Dict[str, Any]]:
         n = steps or self.steps
@@ -497,59 +528,64 @@ class ARK2FreeEnergy:
         return self.history_metrics
 
     def get_summary(self) -> Dict[str, Any]:
-        diversities = [m["approach_diversity"] for m in self.history_metrics if m["approach_diversity"] > 0]
-        final_noise = self.noise_analyzer.analyze() if len(self.noise_analyzer.samples_v) >= 8 else {}
+        diversities = [m["approach_diversity"] for m in self.history_metrics if m.get("approach_diversity", 0) > 0]
+        final_field = self.field_analyzer.analyze() if len(self.field_analyzer.fluct_v) >= 8 else {}
         return {
             "final_gamma": round(self.gamma, 4),
-            "final_residue": round(self.residue, 2),
+            "final_residual_effective": round(self.residual.effective(), 2),
+            "final_potential": round(self.potential, 3),
             "final_entropy": round(self.entropy, 3),
             "recovery_count": self.recovery_count,
             "mean_diversity": round(np.mean(diversities), 5) if diversities else 0.0,
             "recovery_events": len(self.recovery_events),
-            "noise_type_used": self.noise_type.name,
-            "final_noise_class": self.noise_analyzer.classify() if len(self.noise_analyzer.samples_v) >= 8 else "insufficient",
-            "final_residue_noise_corr": round(final_noise.get("residue_corr_v", 0.0), 3) if final_noise else 0.0,
+            "fluctuation_type_final": self.fluctuation_type.name,
+            "final_phase_cont": round(self.phase_cont, 3),
+            "final_phase_label": self.field_analyzer.get_phase_label(self.phase_cont),
+            "final_fluct_res_corr": round(final_field.get("residue_corr", 0.0), 3) if final_field else 0.0,
             "total_steps": len(self.history_metrics)
         }
 
 
 if __name__ == "__main__":
-    print("=" * 72)
-    print("=== ARK2 Free Energy（Improved: Structured Noise + Residue Metabolism） ===")
-    print("  experiments/ のノイズ・残溜解析知見を忠実に統合")
-    print("  デフォルト: STRUCTURED_RESIDUE（res_nv_corr 最高・代謝最適）")
-    print("=" * 72)
+    print("=" * 78)
+    print("=== ARK2 Theoretical Refactor（Fluctuation中心・自己組織化回復・Field解析） ===")
+    print("  理論循環: Potential → Fluctuation → Interaction → ResidualState → FreeEnergy → Recovery(mix) → Emergence")
+    print("  実験結果に縛られず、理論的一貫性を優先。sandbox で忠実に multi-seed 検証")
+    print("=" * 78)
 
-    # 忠実実験: 複数 seed で実行して安定性を確認
     seeds = [42, 123, 777]
-    all_summaries = []
     for sd in seeds:
         ark2 = ARK2FreeEnergy(
             steps=220,
             initial_gamma=0.10,
-            residue_threshold=23.5,
-            noise_type=NoiseType.STRUCTURED_RESIDUE,
+            residual_threshold=17.5,
+            fluctuation_type=FluctuationType.RESIDUE_COUPLED,
             seed=sd
         )
         history = ark2.run()
         summary = ark2.get_summary()
-        all_summaries.append(summary)
-        print(f"\n[Seed {sd}] 回復回数: {summary['recovery_count']}, 最終residue: {summary['final_residue']}, "
-              f"res_noise_corr: {summary['final_residue_noise_corr']}, noise_class: {summary['final_noise_class']}")
+        print(f"\n[Seed {sd}] 回復回数: {summary['recovery_count']}, "
+              f"残溜effective: {summary['final_residual_effective']}, "
+              f"Potential: {summary['final_potential']}, "
+              f"Phase: {summary['final_phase_cont']} ({summary['final_phase_label']}), "
+              f"fluct_res_corr: {summary['final_fluct_res_corr']}")
 
-    # 代表 run の詳細
-    print("\n【代表 run (seed=42) の最結サマリー】")
-    ark2 = ARK2FreeEnergy(steps=220, initial_gamma=0.10, residue_threshold=23.5, noise_type=NoiseType.STRUCTURED_RESIDUE, seed=42)
+    # 代表 run
+    print("\n【代表 run (seed=42) 最結サマリー】")
+    ark2 = ARK2FreeEnergy(steps=220, initial_gamma=0.10, residual_threshold=17.5,
+                          fluctuation_type=FluctuationType.RESIDUE_COUPLED, seed=42)
     history = ark2.run()
     for k, v in ark2.get_summary().items():
         print(f"  {k}: {v}")
 
-    print("\n【回復イベント例（熱 → Work + Entropy + noise_coupling_bonus）】")
-    for ev in ark2.recovery_events[-3:]:
-        print(f"  {ev.event_id}: action={ev.chosen_action} | work={ev.released_work:.3f} | ΔS={ev.entropy_increase:.3f} | score={ev.score:.2f}")
+    print("\n【自己組織化回復イベント例（複数候補混合）】")
+    for ev in ark2.recovery_events[-2:]:
+        print(f"  {ev.event_id}: {ev.chosen_action} | mix_ratio={ev.mix_ratio:.2f} | "
+              f"work={ev.released_work:.3f} | ΔS={ev.entropy_increase:.3f}")
 
-    print("\n" + "=" * 72)
-    print("改善版 ARK2 の忠実実験完了。STRUCTURED_RESIDUE により residue-noise 代謝が活性化され、")
-    print("回復の質と homeostasis が向上していることを確認しました。")
-    print("このファイルを ARK2/ark2_free_energy.py に置き換えてご利用ください。")
-    print("=" * 72)
+    print("\n" + "=" * 78)
+    print("理論的再設計版 ARK2 の忠実実験完了。")
+    print("Fluctuation を中心に揚え、ResidualState の一般化、自己組織化回復、")
+    print("連続 Phase、拡張 Free Energy を実装。長期的な理論発展に適した形になりました。")
+    print("このファイルを ARK2/ark2_free_energy.py に反映してください。")
+    print("=" * 78)
